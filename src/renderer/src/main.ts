@@ -49,7 +49,9 @@ if (isMac && chromePath.value && chromePath.value.includes('\\')) chromePath.val
 userProfile.value = savedConfig.userProfile || ''
 promptTemplate.value = savedConfig.promptTemplate || 'Please generate a standard prompt code for this image including keywords: IMPORTANT, PRIMARY OBJECTIVE, ABSOLUTE CONSTRAINTS'
 waitUpload.value = savedConfig.waitTimeUpload || 5000
-waitGenerate.value = savedConfig.waitTimeGenerate || 30000
+// Ép min 120s cho generate vì ChatGPT tạo ảnh thường 60-180s
+const savedWaitGen = parseInt(savedConfig.waitTimeGenerate) || 180000
+waitGenerate.value = String(Math.max(savedWaitGen, 120000))
 maxRetry.value = savedConfig.maxRetry || 3
 coverImage.value = savedConfig.coverImage || ''
 logoImage.value = savedConfig.logoImage || ''

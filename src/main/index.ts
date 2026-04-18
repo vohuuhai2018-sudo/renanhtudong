@@ -353,6 +353,25 @@ function startPopupWatcher(page: Page, label: string, log: (msg: string) => void
   return () => { stopped = true }
 }
 
+// ========== CHỜ SEND BUTTON ENABLED ==========
+// Sau upload + fill, button "Gửi lời nhắc" có thể còn disabled (ChatGPT đang xử lý upload).
+// Đợi nó enable trước khi click để tránh timeout.
+async function waitForSendEnabled(page: Page, maxWaitMs: number = 60000): Promise<boolean> {
+  const start = Date.now()
+  const selector = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Gửi lời nhắc"]'
+  while (Date.now() - start < maxWaitMs && !shouldStop) {
+    if (page.isClosed()) return false
+    const enabled = await page.evaluate((sel) => {
+      const btn = document.querySelector(sel) as HTMLButtonElement | null
+      if (!btn) return false
+      return !btn.disabled && !btn.hasAttribute('aria-disabled')
+    }, selector).catch(() => false)
+    if (enabled) return true
+    await page.waitForTimeout(500)
+  }
+  return false
+}
+
 // ========== CHỜ ĐẾN KHI KHÔNG CÒN POPUP ==========
 // Block trước mỗi bước input (upload/fill/send) để popup không cắt ngang
 async function ensureNoPopup(page: Page, maxWaitMs: number = 15000): Promise<void> {
@@ -650,7 +669,7 @@ async function waitForPromptComplete(
           '[aria-label*="share" i], [aria-label*="regenerate" i], [aria-label*="tạo lại" i]'
         ).count() > 0
         const stopBtnCount = await page.locator(
-          'button[aria-label*="Stop" i], button[aria-label*="Dừng" i], button[data-testid="stop-button"]'
+          'button[data-testid="stop-button"], button[aria-label*="Stop streaming" i], button[aria-label*="Stop generating" i], button[aria-label*="Dừng phản hồi" i], button[aria-label*="Dừng tạo" i]'
         ).count()
         const stillGenerating = stopBtnCount > 0
         if (!stillGenerating && (hasActionBtn || currentText.includes('```') || stableCount >= 5)) {
@@ -742,37 +761,67 @@ async function waitForImageReady(
     // Reset rate limit count nếu không có popup
     rateLimitCount = 0
     
-    // Tìm ảnh
-    const assistantImgs = page.locator('[data-message-author-role="assistant"] img')
-    const imgCount = await assistantImgs.count()
-    
-    if (imgCount > 0) {
-      const lastImg = assistantImgs.last()
-      
+    // Kiểm tra nút Stop/Dừng — còn = vẫn đang stream
+    const stillGenerating = await page.locator(
+      'button[data-testid="stop-button"], button[aria-label*="Stop streaming" i], button[aria-label*="Stop generating" i], button[aria-label*="Dừng phản hồi" i], button[aria-label*="Dừng tạo" i]'
+    ).count() > 0
+
+    // Scan TẤT CẢ img > 200px, lấy cái lớn nhất đã load xong (ảnh generated không nằm trong [data-message-author-role="assistant"])
+    type BestImg = { src: string; w: number; h: number; nw: number; nh: number }
+    let bestImg: BestImg | null = null
+    if (!stillGenerating) {
       try {
-        const box = await lastImg.boundingBox()
-        const src = await lastImg.getAttribute('src')
-        
-        if (box && box.width > 200 && box.height > 200 && src && src.startsWith('http')) {
-          const naturalWidth = await lastImg.evaluate((el) => {
-            return el.naturalWidth > 0 && el.complete
+        bestImg = await page.evaluate((): BestImg | null => {
+          const imgs = document.querySelectorAll('img')
+          let best: BestImg | null = null
+          imgs.forEach(img => {
+            const el = img as HTMLImageElement
+            const r = el.getBoundingClientRect()
+            if (r.width < 200 || r.height < 200) return
+            if (!el.src || el.src.startsWith('data:')) return
+            if (!el.complete || el.naturalWidth < 200) return
+            const area = r.width * r.height
+            if (!best || area > best.w * best.h) {
+              best = { src: el.src, w: r.width, h: r.height, nw: el.naturalWidth, nh: el.naturalHeight }
+            }
           })
-          
-          if (naturalWidth) {
-            log(`✅ Ảnh đã hoàn thiện (${Math.round(box.width)}x${Math.round(box.height)})`)
-            return true
-          }
-        }
+          return best
+        })
       } catch {}
     }
-    
-    if ((Date.now() - startTime) % 30000 < 2000) {
-      log(`⏳ Đang chờ ảnh hoàn thành...`)
+
+    if (bestImg) {
+      const hasEditOverlay = await page.locator(
+        'button:has-text("Chỉnh sửa"), button:has-text("Edit"), [aria-label*="Chỉnh sửa" i], [aria-label*="Edit image" i]'
+      ).count() > 0
+      const hasActionBtn = await page.locator(
+        'button:has-text("Copy"), [aria-label*="Copy" i], [aria-label*="Sao chép" i], [aria-label*="chia sẻ" i]'
+      ).count() > 0
+
+      if (hasEditOverlay || hasActionBtn) {
+        await page.waitForTimeout(3000)
+        const stableSrc = await page.evaluate((prevSrc: string) => {
+          const imgs = document.querySelectorAll('img')
+          for (const img of Array.from(imgs)) {
+            if ((img as HTMLImageElement).src === prevSrc) return true
+          }
+          return false
+        }, bestImg.src)
+        if (stableSrc) {
+          log(`✅ Ảnh đã hoàn thiện (${Math.round(bestImg.w)}x${Math.round(bestImg.h)}, natural ${bestImg.nw}x${bestImg.nh})`)
+          return true
+        }
+      }
     }
-    
+
+    const elapsed = Date.now() - startTime
+    if (elapsed % 30000 < 2000) {
+      log(`⏳ Đang chờ ảnh hoàn thành... (${Math.round(elapsed / 1000)}s/${Math.round(maxWaitTime / 1000)}s)`)
+    }
+
     await page.waitForTimeout(2000)
   }
-  
+
   return false
 }
 
@@ -814,54 +863,56 @@ async function downloadImage(
   log: (msg: string) => void
 ): Promise<boolean> {
   try {
-    // ===== BƯỚC 1: XÁC NHẬN ẢNH ĐÃ TẠO =====
     log(`🔍 Browser ${pageIndex + 1}: Đang xác nhận ảnh đã tạo...`)
 
-    // Tìm tất cả ảnh trên trang (rộng hơn để không bỏ sót)
-    const allImages = page.locator('img[src^="https://"]')
-    const imgCount = await allImages.count()
+    // Scan TẤT CẢ img > 200px, lấy cái lớn nhất đã load xong (ảnh generated không nằm trong [data-message-author-role="assistant"])
+    type TargetImgInfo = { src: string; w: number; h: number; nw: number }
+    const targetImgInfo: TargetImgInfo | null = await page.evaluate((): TargetImgInfo | null => {
+      const imgs = document.querySelectorAll('img')
+      let best: TargetImgInfo | null = null
+      imgs.forEach(img => {
+        const el = img as HTMLImageElement
+        const r = el.getBoundingClientRect()
+        if (r.width < 200 || r.height < 200) return
+        if (!el.src || el.src.startsWith('data:')) return
+        if (!el.complete || el.naturalWidth < 200) return
+        const area = r.width * r.height
+        if (!best || area > best.w * best.h) {
+          best = { src: el.src, w: r.width, h: r.height, nw: el.naturalWidth }
+        }
+      })
+      return best
+    })
 
-    log(`🔍 Browser ${pageIndex + 1}: Tìm thấy ${imgCount} ảnh trên trang`)
-
-    if (imgCount === 0) {
-      log(`❌ Browser ${pageIndex + 1}: Không tìm thấy ảnh nào`)
+    if (!targetImgInfo) {
+      log(`❌ Browser ${pageIndex + 1}: Không tìm thấy ảnh hợp lệ`)
       return false
     }
 
-    // Tìm ảnh có kích thước lớn (ảnh generated của ChatGPT)
-    // ChatGPT tạo ảnh thường có kích thước >= 1024px
-    let targetImage: any = null
-    let targetBox: any = null
+    log(`✅ Browser ${pageIndex + 1}: Target ảnh ${Math.round(targetImgInfo.w)}x${Math.round(targetImgInfo.h)} (natural ${targetImgInfo.nw}px)`)
 
-    for (let i = 0; i < imgCount; i++) {
-      const img = allImages.nth(i)
-      try {
-        const box = await img.boundingBox()
-        const src = await img.getAttribute('src')
-
-        if (box && box.width > 100 && box.height > 100 && src) {
-          // Ưu tiên ảnh lớn hơn 500px (ảnh generated)
-          if (box.width >= 500 || box.height >= 500) {
-            targetImage = img
-            targetBox = box
-            log(`✅ Browser ${pageIndex + 1}: Tìm thấy ảnh lớn ${Math.round(box.width)}x${Math.round(box.height)}`)
-            break
-          }
-          // Lưu ảnh nhỏ hơn làm backup
-          if (!targetImage) {
-            targetImage = img
-            targetBox = box
-          }
-        }
-      } catch {}
+    // ===== TẢI QUA URL FETCH (ưu tiên — nhanh + không cần lightbox) =====
+    try {
+      const bytes = await page.evaluate(async (url: string) => {
+        const r = await fetch(url)
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        const ab = await r.arrayBuffer()
+        return Array.from(new Uint8Array(ab))
+      }, targetImgInfo.src)
+      await fs.writeFile(finalSavePath, Buffer.from(bytes))
+      log(`✅ Browser ${pageIndex + 1}: Đã lưu (${bytes.length} bytes) tại ${finalSavePath}`)
+      return true
+    } catch (err) {
+      log(`⚠️ Browser ${pageIndex + 1}: Fetch URL lỗi (${getErrorMessage(err)}), thử qua lightbox...`)
     }
 
-    if (!targetImage || !targetBox) {
-      // Fallback: dùng ảnh cuối cùng
-      targetImage = allImages.last()
-      targetBox = await targetImage.boundingBox()
-      log(`⚠️ Browser ${pageIndex + 1}: Dùng ảnh cuối cùng làm backup`)
-    }
+    // ===== FALLBACK: click lightbox + download button =====
+    const targetImage = page.locator(`img[src="${targetImgInfo.src.replace(/"/g, '\\"')}"]`).first()
+    const targetBox = { x: 0, y: 0, width: targetImgInfo.w, height: targetImgInfo.h }
+    try {
+      const b = await targetImage.boundingBox()
+      if (b) { targetBox.x = b.x; targetBox.y = b.y; targetBox.width = b.width; targetBox.height = b.height }
+    } catch {}
 
     // ===== BƯỚC 2: CLICK VÀO ẢNH ĐỂ MỞ LIGHTBOX =====
     log(`🖼️ Browser ${pageIndex + 1}: Click vào ảnh...`)
@@ -1121,8 +1172,16 @@ async function processImageInBrowser(
     await pageA.waitForTimeout(500)
     await ensureNoPopup(pageA)
 
-    const sendBtnA = pageA.locator('button[data-testid="send-button"], button[aria-label="Send prompt"]').first()
-    await sendBtnA.click()
+    // Đợi send button enabled (upload có thể còn pending)
+    const enabledA = await waitForSendEnabled(pageA!, 60000)
+    if (!enabledA) {
+      log(`⚠️ Browser ${imageIndex + 1}: Tab A - send button vẫn disabled sau 60s, thử bằng Enter`)
+    }
+
+    const sendBtnA = pageA.locator('button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Gửi lời nhắc"]').first()
+    await sendBtnA.click({ timeout: 10000 }).catch(async () => {
+      await pageA!.keyboard.press('Enter')
+    })
     
     // Kiểm tra popup sau khi gửi
     await pageA.waitForTimeout(2000)
@@ -1239,8 +1298,15 @@ async function processImageInBrowser(
     log(`🚀 Browser ${imageIndex + 1}: Tab B - Gửi render...`)
     await ensureNoPopup(pageB)
 
-    const sendBtnB = pageB.locator('button[data-testid="send-button"], button[aria-label="Send prompt"]').first()
-    await sendBtnB.click()
+    const enabledB = await waitForSendEnabled(pageB!, 60000)
+    if (!enabledB) {
+      log(`⚠️ Browser ${imageIndex + 1}: Tab B - send button vẫn disabled sau 60s, thử bằng Enter`)
+    }
+
+    const sendBtnB = pageB.locator('button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Gửi lời nhắc"]').first()
+    await sendBtnB.click({ timeout: 10000 }).catch(async () => {
+      await pageB!.keyboard.press('Enter')
+    })
     
     // Kiểm tra popup
     await pageB.waitForTimeout(2000)
