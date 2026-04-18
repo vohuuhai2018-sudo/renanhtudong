@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Sơn Hải AI Render</title>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <div class="logo">
+          <span class="icon">🎨</span>
+          <h1>Sơn Hải <span>AI Render</span></h1>
+        </div>
+        <div class="header-actions">
+          <button id="mode-toggle" class="btn-icon">Chế độ chờ</button>
+        </div>
+      </header>
+
+      <main>
+        <div class="config-panel">
+          <section class="card">
+            <h2><span class="icon">📂</span> Cấu hình thư mục</h2>
+            
+            <div class="input-group">
+              <label>Thư mục ảnh đầu vào</label>
+              <div class="row">
+                <input type="text" id="input-folder" placeholder="D:\DuAn\AnhGoc" readonly />
+                <button id="btn-input" class="btn-secondary">Chọn</button>
+              </div>
+            </div>
+
+            <div class="input-group">
+              <label>Thư mục tải ảnh về</label>
+              <div class="row">
+                <input type="text" id="output-folder" placeholder="D:\DuAn\KetQua" readonly />
+                <button id="btn-output" class="btn-secondary">Chọn</button>
+              </div>
+            </div>
+
+            <details>
+              <summary>⚙️ Cấu hình trình duyệt (Nâng cao)</summary>
+              <div class="details-content">
+                <div class="input-group">
+                  <label>Đường dẫn Chrome (.exe)</label>
+                  <div class="row">
+                    <input type="text" id="chrome-path" placeholder="C:\Program Files\Google\Chrome\Application\chrome.exe" />
+                    <button id="btn-chrome" class="btn-secondary">Chọn</button>
+                  </div>
+                </div>
+                <div class="input-group">
+                  <label>Thư mục Profile (User Data)</label>
+                  <div class="row">
+                    <input type="text" id="user-profile" placeholder="C:\Users\Admin\AppData\Local\Google\Chrome\User Data" />
+                    <button id="btn-profile" class="btn-secondary">Chọn</button>
+                  </div>
+                </div>
+              </div>
+            </details>
+          </section>
+
+          <section class="card prompt-card">
+            <div class="card-header">
+              <h2><span class="icon">📝</span> Prompt Template</h2>
+              <div class="prompt-actions">
+                <button id="btn-load-prompt" class="btn-text">📥 Nạp</button>
+                <button id="btn-save-prompt" class="btn-text">💾 Lưu</button>
+              </div>
+            </div>
+            <textarea id="prompt-template" placeholder="Nhập template tại đây..."></textarea>
+            
+            <div class="settings-grid">
+               <div class="input-group">
+                 <label>Chờ Upload (ms)</label>
+                 <input type="number" id="wait-upload" value="5000" />
+               </div>
+               <div class="input-group">
+                 <label>Chờ Generate (ms)</label>
+                 <input type="number" id="wait-generate" value="30000" />
+               </div>
+               <div class="input-group">
+                 <label>Max Retry</label>
+                 <input type="number" id="max-retry" value="3" />
+               </div>
+            </div>
+          </section>
+
+          <section class="card pdf-card">
+            <h2><span class="icon">📄</span> Tạo PDF + Watermark</h2>
+            
+            <div class="pdf-options">
+              <div class="input-group">
+                <label>Ảnh bìa PDF (tùy chọn)</label>
+                <div class="row">
+                  <input type="text" id="cover-image" placeholder="Chọn ảnh bìa..." readonly />
+                  <button id="btn-cover" class="btn-secondary">Chọn</button>
+                  <button id="btn-clear-cover" class="btn-clear" title="Xóa ảnh bìa">✕</button>
+                </div>
+                <div id="cover-preview" class="image-preview"></div>
+              </div>
+
+              <div class="input-group">
+                <label>Logo watermark (tùy chọn)</label>
+                <div class="row">
+                  <input type="text" id="logo-image" placeholder="Chọn logo..." readonly />
+                  <button id="btn-logo" class="btn-secondary">Chọn</button>
+                  <button id="btn-clear-logo" class="btn-clear" title="Xóa logo">✕</button>
+                </div>
+                <div id="logo-preview" class="image-preview"></div>
+              </div>
+
+              <div class="row-2col">
+                <div class="input-group">
+                  <label>Kích thước Logo (%)</label>
+                  <input type="number" id="logo-size" value="8" min="3" max="30" />
+                </div>
+                <div class="input-group">
+                  <label>Vị trí Logo</label>
+                  <select id="logo-position">
+                    <option value="1">⬜ Trái trên</option>
+                    <option value="2">⬜ Phải trên</option>
+                    <option value="3">⬜ Trái dưới</option>
+                    <option value="4" selected>⬜ Phải dưới</option>
+                    <option value="5">⬜ Giữa</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div class="pdf-actions">
+              <button id="btn-watermark" class="btn-watermark">🖼️ Gắn Logo lên Ảnh</button>
+              <button id="btn-create-pdf" class="btn-pdf">📄 Tạo PDF</button>
+            </div>
+          </section>
+
+          <div class="actions">
+            <button id="btn-start" class="btn-primary">🚀 Bắt đầu Quy trình</button>
+            <button id="btn-stop" class="btn-danger">⏹️ Dừng</button>
+          </div>
+        </div>
+
+        <div class="log-panel">
+          <div class="card log-card">
+            <h2>Console Logs</h2>
+            <div id="log-container">
+              <p class="log-msg system">Chào mừng bạn đến với Sơn Hải AI Render v1.0</p>
+            </div>
+          </div>
+          <div class="status-bar">
+            <span id="status-text">Sẵn sàng...</span>
+            <span id="progress-text">0/0</span>
+            <div class="progress-bg">
+              <div id="progress-bar" style="width: 0%"></div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+    <!-- Wait for Got It overlay -->
+    <div id="wait-overlay">
+      <div class="wait-box">
+        <div class="wait-icon">⏸️</div>
+        <div class="wait-title">CHỜ BẠN BẤM "GOT IT"</div>
+        <div class="wait-desc">Tool đã phát hiện thông báo<br><strong>"Too many requests"</strong> từ ChatGPT</div>
+        <div class="wait-sub">Vui lòng bấm nút <strong>Got it</strong> trên trình duyệt<br>Tool sẽ tự động tiếp tục sau khi bấm xong</div>
+        <div class="wait-spinner"></div>
+      </div>
+    </div>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

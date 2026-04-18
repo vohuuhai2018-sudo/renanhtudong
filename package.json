@@ -1,0 +1,52 @@
+{
+  "name": "son-hai-ai-render",
+  "version": "1.0.0",
+  "description": "Tool tự động hóa xử lý hình ảnh với ChatGPT",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "package": "electron-vite build && electron-packager . \"Son Hai AI Render\" --platform=win32 --arch=x64 --out=release_v3 --overwrite --asar"
+  },
+  "dependencies": {
+    "@types/pdfkit": "^0.17.6",
+    "fs-extra": "^11.2.0",
+    "jimp": "^0.22.12",
+    "pdfkit": "^0.18.0",
+    "playwright": "^1.42.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "devDependencies": {
+    "@electron-toolkit/utils": "^3.0.0",
+    "electron": "^29.1.1",
+    "electron-builder": "^24.13.3",
+    "electron-packager": "^17.1.2",
+    "electron-vite": "^2.1.0",
+    "typescript": "^5.3.3",
+    "vite": "^5.1.4"
+  },
+  "build": {
+    "appId": "com.sonhai.airender",
+    "productName": "Son Hai AI Render",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "resources/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/jimp/**/*"
+    ]
+  }
+}
