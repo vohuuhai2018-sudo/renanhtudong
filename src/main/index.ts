@@ -1228,24 +1228,56 @@ async function processImageInBrowser(
         await pageB.waitForTimeout(1500)
       }
 
-      // Click nút "+" (aria-label "thêm tệp và nhiều tính năng khác" | "add files and more features")
-      const plusBtn = pageB.locator(
-        'button[aria-label*="thêm tệp" i], button[aria-label*="add files" i], button[aria-label*="more features" i]'
-      ).first()
-
-      try {
-        await plusBtn.waitFor({ state: 'visible', timeout: 5000 })
-        await plusBtn.click({ timeout: 3000 })
-        await pageB.waitForTimeout(1500)
-      } catch {
-        log(`⚠️ Browser ${imageIndex + 1}: lần ${attempt} - không tìm thấy nút +`)
-        await pageB.waitForTimeout(1500)
-        continue
+      // Click nút "+" — hỗ trợ cả VI & EN + fallback: tìm button + gần composer
+      let plusClicked = false
+      const plusSelectors = [
+        'button[aria-label*="thêm tệp" i]',
+        'button[aria-label*="add files" i]',
+        'button[aria-label*="add photos" i]',
+        'button[aria-label*="attach" i]',
+        'button[aria-label*="more features" i]',
+        'button[aria-label*="more options" i]'
+      ]
+      for (const sel of plusSelectors) {
+        const btn = pageB.locator(sel).first()
+        if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+          await btn.click({ timeout: 3000 }).catch(() => {})
+          plusClicked = true
+          break
+        }
       }
+      if (!plusClicked) {
+        // Fallback: tìm button có haspopup="menu" gần #prompt-textarea (composer form)
+        const fallbackClicked = await pageB.evaluate(() => {
+          const ta = document.querySelector('#prompt-textarea')
+          if (!ta) return false
+          const form = ta.closest('form') || ta.parentElement?.parentElement
+          if (!form) return false
+          const btns = form.querySelectorAll('button[aria-haspopup="menu"]')
+          for (const b of Array.from(btns)) {
+            const r = (b as HTMLElement).getBoundingClientRect()
+            if (r.width > 0 && r.height > 0) {
+              ;(b as HTMLElement).click()
+              return true
+            }
+          }
+          return false
+        })
+        if (!fallbackClicked) {
+          log(`⚠️ Browser ${imageIndex + 1}: lần ${attempt} - không tìm thấy nút +`)
+          await pageB.waitForTimeout(1500)
+          continue
+        }
+      }
+      await pageB.waitForTimeout(1500)
 
-      // Tìm element có ownText đúng "Tạo hình ảnh" / "Create image" rồi mouse-click tại tọa độ
+      // Tìm element có ownText khớp "Tạo hình ảnh" / "Create image" rồi mouse-click tại tọa độ
       const targetRect = await pageB.evaluate(() => {
-        const keywords = ['tạo hình ảnh', 'tạo ảnh', 'create image', 'create an image']
+        const keywords = [
+          'tạo hình ảnh', 'tạo ảnh',
+          'create image', 'create an image', 'create images', 'generate image',
+          'make image', 'make an image'
+        ]
         const all = Array.from(document.querySelectorAll('*'))
         for (const el of all) {
           const ownText = Array.from(el.childNodes)
@@ -1253,11 +1285,11 @@ async function processImageInBrowser(
             .map((n: Node) => (n.textContent || '').trim().toLowerCase())
             .join(' ')
             .trim()
-          if (!ownText) continue
+          if (!ownText || ownText.length > 40) continue
           if (!keywords.some(k => ownText === k || ownText.startsWith(k))) continue
           const rect = el.getBoundingClientRect()
           if (rect.width < 10 || rect.height < 10) continue
-          if (rect.x < 250 && rect.width < 250) continue
+          if (rect.x < 250 && rect.width < 250) continue // loại sidebar
           return { x: rect.x, y: rect.y, w: rect.width, h: rect.height }
         }
         return null
