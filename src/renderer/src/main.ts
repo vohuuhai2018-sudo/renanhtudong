@@ -265,6 +265,49 @@ btnStop.addEventListener('click', async () => {
   }
 })
 
+// ========== LOGIN / LOGOUT CONTROLS ==========
+const btnLogout = document.getElementById('btn-logout') as HTMLButtonElement
+const btnOpenLogin = document.getElementById('btn-open-login') as HTMLButtonElement
+const btnConfirmLogin = document.getElementById('btn-confirm-login') as HTMLButtonElement
+
+btnLogout.addEventListener('click', async () => {
+  if (!confirm('Xoá cookies/session của 5 browser profiles để đăng xuất tài khoản ChatGPT hiện tại?')) return
+  btnLogout.disabled = true
+  addLog('🚪 Đang xoá cookies/session...')
+  const r = await electron.ipcRenderer.invoke('logout-accounts')
+  btnLogout.disabled = false
+  if (r.success) addLog(`✅ Đã xoá ${r.removed} profile. Bấm "Đăng nhập tài khoản mới" để tiếp tục.`)
+  else addLog(`❌ Lỗi đăng xuất: ${r.error}`)
+})
+
+btnOpenLogin.addEventListener('click', async () => {
+  btnOpenLogin.disabled = true
+  addLog('🔑 Đang mở trình duyệt đăng nhập...')
+  const r = await electron.ipcRenderer.invoke('open-login-browser')
+  if (r.success) {
+    btnConfirmLogin.disabled = false
+    addLog('👉 Đăng nhập ChatGPT + xác thực 2FA xong, bấm "Xác nhận đã đăng nhập".')
+  } else {
+    btnOpenLogin.disabled = false
+    addLog(`❌ Không mở được browser: ${r.message || 'unknown'}`)
+  }
+})
+
+btnConfirmLogin.addEventListener('click', async () => {
+  btnConfirmLogin.disabled = true
+  btnConfirmLogin.textContent = 'Đang đồng bộ...'
+  addLog('✅ Xác nhận login — đóng browser và copy session sang 4 profile còn lại...')
+  const r = await electron.ipcRenderer.invoke('confirm-login-done')
+  btnConfirmLogin.textContent = '✅ Xác nhận đã đăng nhập'
+  btnOpenLogin.disabled = false
+  if (r.success) {
+    addLog('✨ Đồng bộ xong. Có thể bấm "Bắt đầu Quy trình".')
+  } else {
+    btnConfirmLogin.disabled = false
+    addLog(`❌ Lỗi: ${r.message}`)
+  }
+})
+
 // Listen for logs from main process
 electron.ipcRenderer.on('automation-log', (msg: string) => {
   addLog(msg)

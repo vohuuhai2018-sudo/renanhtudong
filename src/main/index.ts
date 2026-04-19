@@ -1685,3 +1685,90 @@ ipcMain.handle('stop-automation', async () => {
   isRunning = false
   return { success: true }
 })
+
+// ========== LOGOUT: XOÁ HẾT PROFILE ĐỂ ĐĂNG XUẤT TÀI KHOẢN CHATGPT ==========
+ipcMain.handle('logout-accounts', async () => {
+  try {
+    const PROFILES = 5
+    let removed = 0
+    for (let i = 0; i < PROFILES; i++) {
+      const dir = getBrowserProfileDir(i)
+      if (await fs.pathExists(dir)) {
+        await fs.remove(dir)
+        removed++
+      }
+    }
+    return { success: true, removed }
+  } catch (err) {
+    return { success: false, error: getErrorMessage(err) }
+  }
+})
+
+// Giữ reference để close khi user confirm
+let loginContext: BrowserContext | null = null
+
+// ========== OPEN LOGIN BROWSER: mở profile-0, chờ user login + 2FA ==========
+ipcMain.handle('open-login-browser', async (event) => {
+  if (loginContext) {
+    return { success: false, message: 'Đang có phiên login khác mở, vui lòng confirm hoặc hủy trước' }
+  }
+  const log = (msg: string) => {
+    try { if (!event.sender.isDestroyed()) event.sender.send('automation-log', msg) } catch {}
+  }
+  try {
+    const profileDir = getBrowserProfileDir(0)
+    await fs.ensureDir(profileDir)
+    log(`🔑 Mở trình duyệt đăng nhập tại profile-0...`)
+    loginContext = await chromium.launchPersistentContext(profileDir, {
+      headless: false,
+      viewport: { width: 1280, height: 900 },
+      ignoreDefaultArgs: ['--enable-automation'],
+      args: ['--disable-blink-features=AutomationControlled', '--disable-infobars']
+    })
+    const page = loginContext.pages()[0] || await loginContext.newPage()
+    await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 60000 })
+    log(`✅ Browser đã mở. Đăng nhập (kể cả 2FA) xong thì bấm "Xác nhận đã đăng nhập" trong app.`)
+
+    // Khi user đóng browser thủ công → coi như hủy phiên login
+    loginContext.on('close', () => {
+      loginContext = null
+      log(`⚠️ Browser login đã đóng. Nếu chưa bấm "Xác nhận", session KHÔNG được copy.`)
+    })
+
+    return { success: true }
+  } catch (err) {
+    loginContext = null
+    return { success: false, message: getErrorMessage(err) }
+  }
+})
+
+// ========== CONFIRM LOGIN DONE: copy profile-0 sang 1..4, đóng browser ==========
+ipcMain.handle('confirm-login-done', async (event) => {
+  const log = (msg: string) => {
+    try { if (!event.sender.isDestroyed()) event.sender.send('automation-log', msg) } catch {}
+  }
+  if (!loginContext) {
+    return { success: false, message: 'Chưa có browser login đang mở' }
+  }
+  try {
+    log(`💾 Đóng browser và lưu session...`)
+    await loginContext.close().catch(() => {})
+    loginContext = null
+
+    const src = getBrowserProfileDir(0)
+    if (!(await fs.pathExists(src))) {
+      return { success: false, message: 'Profile-0 không tồn tại' }
+    }
+    log(`📋 Copy session sang profile 1..4...`)
+    for (let i = 1; i <= 4; i++) {
+      const dst = getBrowserProfileDir(i)
+      await fs.remove(dst)
+      await fs.copy(src, dst)
+      log(`  ✅ profile-${i}`)
+    }
+    log(`✨ Đã đồng bộ login cho 5 browsers. Sẵn sàng chạy lại quy trình.`)
+    return { success: true }
+  } catch (err) {
+    return { success: false, message: getErrorMessage(err) }
+  }
+})
