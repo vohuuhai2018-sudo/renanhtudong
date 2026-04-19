@@ -766,12 +766,14 @@ async function waitForImageReady(
       'button[data-testid="stop-button"], button[aria-label*="Stop streaming" i], button[aria-label*="Stop generating" i], button[aria-label*="Dừng phản hồi" i], button[aria-label*="Dừng tạo" i]'
     ).count() > 0
 
-    // Scan TẤT CẢ img > 200px, lấy cái lớn nhất đã load xong (ảnh generated không nằm trong [data-message-author-role="assistant"])
-    type BestImg = { src: string; w: number; h: number; nw: number; nh: number }
+    // Scan img, ƯU TIÊN ảnh có alt="Ảnh đã tạo"/"Generated image" (ảnh assistant generated)
+    // Loại ảnh inside [data-message-author-role="user"] (ảnh user upload input)
+    type BestImg = { src: string; w: number; h: number; nw: number; nh: number; score: number }
     let bestImg: BestImg | null = null
     if (!stillGenerating) {
       try {
         bestImg = await page.evaluate((): BestImg | null => {
+          const GEN_ALT_PREFIXES = ['ảnh đã tạo', 'generated image', 'image:', 'ảnh được tạo']
           const imgs = document.querySelectorAll('img')
           let best: BestImg | null = null
           imgs.forEach(img => {
@@ -780,9 +782,15 @@ async function waitForImageReady(
             if (r.width < 200 || r.height < 200) return
             if (!el.src || el.src.startsWith('data:')) return
             if (!el.complete || el.naturalWidth < 200) return
+            // Loại ảnh user upload
+            if (el.closest('[data-message-author-role="user"]')) return
+            // Score: alt khớp "Ảnh đã tạo" = 1000, không = 0
+            const alt = (el.alt || '').toLowerCase()
+            const altScore = GEN_ALT_PREFIXES.some(p => alt.startsWith(p)) ? 1000000 : 0
             const area = r.width * r.height
-            if (!best || area > best.w * best.h) {
-              best = { src: el.src, w: r.width, h: r.height, nw: el.naturalWidth, nh: el.naturalHeight }
+            const score = altScore + area
+            if (!best || score > best.score) {
+              best = { src: el.src, w: r.width, h: r.height, nw: el.naturalWidth, nh: el.naturalHeight, score }
             }
           })
           return best
@@ -799,18 +807,44 @@ async function waitForImageReady(
       ).count() > 0
 
       if (hasEditOverlay || hasActionBtn) {
-        await page.waitForTimeout(3000)
-        const stableSrc = await page.evaluate((prevSrc: string) => {
-          const imgs = document.querySelectorAll('img')
-          for (const img of Array.from(imgs)) {
-            if ((img as HTMLImageElement).src === prevSrc) return true
+        // Stability window: 4 samples × 2s = 8s yêu cầu src + naturalWidth ổn định
+        // và Stop button không bật lại. ChatGPT streaming reveal ảnh top-to-bottom,
+        // dù Edit/Copy xuất hiện sớm, naturalWidth vẫn có thể nhảy khi ảnh re-decode.
+        const STABILITY_SAMPLES = 4
+        const SAMPLE_INTERVAL = 2000
+        let stableCount = 0
+        let lastNw = bestImg.nw
+        let lastSrc = bestImg.src
+
+        for (let i = 0; i < STABILITY_SAMPLES; i++) {
+          await page.waitForTimeout(SAMPLE_INTERVAL)
+          const state = await page.evaluate((src: string) => {
+            const imgs = document.querySelectorAll('img')
+            let match: HTMLImageElement | null = null
+            imgs.forEach(img => {
+              if ((img as HTMLImageElement).src === src) match = img as HTMLImageElement
+            })
+            const stopBtn = document.querySelector(
+              'button[data-testid="stop-button"], button[aria-label*="Stop streaming" i], button[aria-label*="Dừng" i]'
+            )
+            if (!match) return { found: false, stillGen: !!stopBtn, nw: 0, complete: false }
+            const m = match as HTMLImageElement
+            return { found: true, stillGen: !!stopBtn, nw: m.naturalWidth, complete: m.complete }
+          }, lastSrc)
+
+          if (!state.found || state.stillGen || !state.complete || state.nw !== lastNw || state.nw < 512) {
+            stableCount = 0
+            if (state.found) lastNw = state.nw
+          } else {
+            stableCount++
           }
-          return false
-        }, bestImg.src)
-        if (stableSrc) {
-          log(`✅ Ảnh đã hoàn thiện (${Math.round(bestImg.w)}x${Math.round(bestImg.h)}, natural ${bestImg.nw}x${bestImg.nh})`)
+        }
+
+        if (stableCount >= STABILITY_SAMPLES - 1) {
+          log(`✅ Ảnh đã hoàn thiện (${Math.round(bestImg.w)}x${Math.round(bestImg.h)}, natural ${lastNw}px, stable ${stableCount}/${STABILITY_SAMPLES})`)
           return true
         }
+        log(`⏳ Ảnh chưa stable (${stableCount}/${STABILITY_SAMPLES}), tiếp tục chờ...`)
       }
     }
 
@@ -855,6 +889,28 @@ async function extractPrompt(page: Page, log: (msg: string) => void): Promise<st
   }
 }
 
+// Validate bytes đã tải có phải ảnh hoàn thiện không.
+// Trả về null nếu hợp lệ, hoặc chuỗi lý do nếu partial/lỗi.
+async function validateImageBytes(
+  bytes: Buffer,
+  expectedNw: number
+): Promise<string | null> {
+  if (bytes.length < 10000) return `quá nhỏ (${bytes.length} bytes)`
+  try {
+    const img = await Jimp.read(bytes)
+    const w = img.getWidth()
+    const h = img.getHeight()
+    if (w < 512 || h < 512) return `dimensions nhỏ (${w}x${h})`
+    // Cho sai số ±8% vs expected — ChatGPT đôi khi serve scaled variant
+    if (expectedNw > 0 && Math.abs(w - expectedNw) / expectedNw > 0.08) {
+      return `width ${w} lệch expected ${expectedNw}`
+    }
+    return null
+  } catch (e) {
+    return `decode lỗi: ${getErrorMessage(e)}`
+  }
+}
+
 // ========== HÀM TẢI ẢNH ==========
 async function downloadImage(
   page: Page,
@@ -865,23 +921,29 @@ async function downloadImage(
   try {
     log(`🔍 Browser ${pageIndex + 1}: Đang xác nhận ảnh đã tạo...`)
 
-    // Scan TẤT CẢ img > 200px, lấy cái lớn nhất đã load xong (ảnh generated không nằm trong [data-message-author-role="assistant"])
-    type TargetImgInfo = { src: string; w: number; h: number; nw: number }
+    // Scan img, ƯU TIÊN alt="Ảnh đã tạo"/"Generated", LOẠI ảnh trong user message (upload input)
+    type TargetImgInfo = { src: string; w: number; h: number; nw: number; alt: string }
     const targetImgInfo: TargetImgInfo | null = await page.evaluate((): TargetImgInfo | null => {
+      const GEN_ALT_PREFIXES = ['ảnh đã tạo', 'generated image', 'image:', 'ảnh được tạo']
       const imgs = document.querySelectorAll('img')
-      let best: TargetImgInfo | null = null
+      let best: (TargetImgInfo & { score: number }) | null = null
       imgs.forEach(img => {
         const el = img as HTMLImageElement
         const r = el.getBoundingClientRect()
         if (r.width < 200 || r.height < 200) return
         if (!el.src || el.src.startsWith('data:')) return
         if (!el.complete || el.naturalWidth < 200) return
-        const area = r.width * r.height
-        if (!best || area > best.w * best.h) {
-          best = { src: el.src, w: r.width, h: r.height, nw: el.naturalWidth }
+        if (el.closest('[data-message-author-role="user"]')) return
+        const alt = (el.alt || '').toLowerCase()
+        const altScore = GEN_ALT_PREFIXES.some(p => alt.startsWith(p)) ? 1000000 : 0
+        const score = altScore + r.width * r.height
+        if (!best || score > best.score) {
+          best = { src: el.src, w: r.width, h: r.height, nw: el.naturalWidth, alt: el.alt || '', score }
         }
       })
-      return best
+      if (!best) return null
+      const { src, w, h, nw, alt } = best
+      return { src, w, h, nw, alt }
     })
 
     if (!targetImgInfo) {
@@ -889,24 +951,104 @@ async function downloadImage(
       return false
     }
 
-    log(`✅ Browser ${pageIndex + 1}: Target ảnh ${Math.round(targetImgInfo.w)}x${Math.round(targetImgInfo.h)} (natural ${targetImgInfo.nw}px)`)
+    log(`✅ Browser ${pageIndex + 1}: Target ảnh ${Math.round(targetImgInfo.w)}x${Math.round(targetImgInfo.h)} (natural ${targetImgInfo.nw}px) alt="${targetImgInfo.alt.substring(0, 60)}"`)
+    log(`📎 Browser ${pageIndex + 1}: URL ${targetImgInfo.src.substring(0, 120)}...`)
 
-    // ===== TẢI QUA URL FETCH (ưu tiên — nhanh + không cần lightbox) =====
+    // ===== CÁCH 1 (PRIMARY): CLICK SHARE → TẢI XUỐNG =====
+    // Đây là cách ChatGPT cung cấp bytes final — server gửi file đã finalize,
+    // không phải URL streaming còn đang render. Đảm bảo ảnh không bị cắt/vỡ.
     try {
-      const bytes = await page.evaluate(async (url: string) => {
-        const r = await fetch(url)
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        const ab = await r.arrayBuffer()
-        return Array.from(new Uint8Array(ab))
-      }, targetImgInfo.src)
-      await fs.writeFile(finalSavePath, Buffer.from(bytes))
-      log(`✅ Browser ${pageIndex + 1}: Đã lưu (${bytes.length} bytes) tại ${finalSavePath}`)
+      log(`📥 Browser ${pageIndex + 1}: Click Chia sẻ hình ảnh → Tải xuống...`)
+      // Đảm bảo ảnh trong viewport để share button visible
+      const imgLoc = page.locator(`img[src="${targetImgInfo.src.replace(/"/g, '\\"')}"]`).first()
+      await imgLoc.scrollIntoViewIfNeeded().catch(() => {})
+      await imgLoc.hover().catch(() => {})
+      await page.waitForTimeout(500)
+
+      const shareBtn = page.locator(
+        'button[aria-label="Chia sẻ hình ảnh này"], button[aria-label*="Chia sẻ hình ảnh" i], button[aria-label*="share image" i]'
+      ).first()
+      await shareBtn.click({ timeout: 8000 })
+      // Dialog cần ~2s để render đầy đủ các nút
+      await page.waitForTimeout(2500)
+
+      const dlPromise = page.waitForEvent('download', { timeout: 20000 })
+      const downloadBtn = page.locator(
+        '[role="dialog"] button:has-text("Tải xuống"), [role="dialog"] button:has-text("Download")'
+      ).first()
+      await downloadBtn.click({ timeout: 8000 })
+      const dl = await dlPromise
+      await dl.saveAs(finalSavePath)
+      const stat = await fs.stat(finalSavePath)
+      // Đóng dialog
+      await page.keyboard.press('Escape').catch(() => {})
+      // Validate bytes
+      const buf = await fs.readFile(finalSavePath)
+      const invalid = await validateImageBytes(buf, targetImgInfo.nw)
+      if (invalid) {
+        log(`⚠️ Browser ${pageIndex + 1}: Share download không hợp lệ (${invalid}), thử cách khác...`)
+        throw new Error(`validate fail: ${invalid}`)
+      }
+      log(`✅ Browser ${pageIndex + 1}: Đã lưu ${(stat.size / 1024).toFixed(0)} KB qua share dialog (validated)`)
       return true
     } catch (err) {
-      log(`⚠️ Browser ${pageIndex + 1}: Fetch URL lỗi (${getErrorMessage(err)}), thử qua lightbox...`)
+      log(`⚠️ Browser ${pageIndex + 1}: Share → Tải xuống lỗi: ${getErrorMessage(err)}, thử fetch URL...`)
+      // Đảm bảo dialog đóng nếu đang mở
+      await page.keyboard.press('Escape').catch(() => {})
+      await page.waitForTimeout(500)
     }
 
-    // ===== FALLBACK: click lightbox + download button =====
+    // ===== CÁCH 2 (FALLBACK): TẢI QUA URL FETCH =====
+    // Chỉ dùng nếu share flow fail. Retry 3 lần kèm validate decode.
+    const FETCH_RETRIES = 3
+    for (let attempt = 0; attempt < FETCH_RETRIES; attempt++) {
+      try {
+        log(`📥 Browser ${pageIndex + 1}: Thử fetch URL trực tiếp (lần ${attempt + 1}/${FETCH_RETRIES})...`)
+        const bytes = await page.evaluate(async (url: string) => {
+          const r = await fetch(url, { credentials: 'include', cache: 'no-store' })
+          if (!r.ok) throw new Error(`HTTP ${r.status}`)
+          const ab = await r.arrayBuffer()
+          return Array.from(new Uint8Array(ab))
+        }, targetImgInfo.src)
+        const buf = Buffer.from(bytes)
+        const invalid = await validateImageBytes(buf, targetImgInfo.nw)
+        if (invalid) {
+          log(`⚠️ Browser ${pageIndex + 1}: Bytes không hợp lệ (${invalid}), chờ 5s rồi thử lại...`)
+          if (attempt < FETCH_RETRIES - 1) await page.waitForTimeout(5000)
+          continue
+        }
+        await fs.writeFile(finalSavePath, buf)
+        log(`✅ Browser ${pageIndex + 1}: Đã lưu ${(buf.length / 1024).toFixed(0)} KB qua fetch URL (validated)`)
+        return true
+      } catch (err) {
+        log(`⚠️ Browser ${pageIndex + 1}: Fetch URL lỗi: ${getErrorMessage(err)}`)
+        if (attempt < FETCH_RETRIES - 1) await page.waitForTimeout(3000)
+      }
+    }
+
+    // ===== CÁCH 3 (FALLBACK): context.request =====
+    try {
+      log(`📥 Browser ${pageIndex + 1}: Thử context.request.get...`)
+      const ctx = page.context()
+      const resp = await ctx.request.get(targetImgInfo.src)
+      if (resp.ok()) {
+        const body = await resp.body()
+        const invalid = await validateImageBytes(body, targetImgInfo.nw)
+        if (!invalid) {
+          await fs.writeFile(finalSavePath, body)
+          log(`✅ Browser ${pageIndex + 1}: Đã lưu ${(body.length / 1024).toFixed(0)} KB qua context.request (validated)`)
+          return true
+        }
+        log(`⚠️ Browser ${pageIndex + 1}: context.request bytes không hợp lệ (${invalid})`)
+      } else {
+        log(`⚠️ Browser ${pageIndex + 1}: HTTP ${resp.status()}`)
+      }
+    } catch (err) {
+      log(`⚠️ Browser ${pageIndex + 1}: context.request lỗi: ${getErrorMessage(err)}`)
+    }
+
+    // ===== CÁCH 4 (LEGACY FALLBACK): click lightbox + download button =====
+    log(`📥 Browser ${pageIndex + 1}: Thử lightbox fallback...`)
     const targetImage = page.locator(`img[src="${targetImgInfo.src.replace(/"/g, '\\"')}"]`).first()
     const targetBox = { x: 0, y: 0, width: targetImgInfo.w, height: targetImgInfo.h }
     try {
@@ -1429,15 +1571,18 @@ ipcMain.handle('start-automation', async (event, config) => {
       chromePath,
       promptTemplate,
       waitTimeUpload,
-      waitTimeGenerate
+      waitTimeGenerate,
+      maxRetry
     } = config
 
     const finalOutputFolder = outputFolder || path.join(inputFolder, 'AI')
-    log(`🚀 Bắt đầu quy trình với 5 BROWSERS riêng biệt...`)
-    
+    const CONCURRENCY = 5
+    const retryCap = Math.max(0, parseInt(maxRetry) || 3)
+    log(`🚀 Bắt đầu quy trình với ${CONCURRENCY} BROWSERS song song, max retry = ${retryCap}`)
+
     await fs.ensureDir(finalOutputFolder)
-    
-    const files = (await fs.readdir(inputFolder)).filter(f => 
+
+    const files = (await fs.readdir(inputFolder)).filter(f =>
       ['.jpg', '.png', '.jpeg'].includes(path.extname(f).toLowerCase())
     )
 
@@ -1450,45 +1595,83 @@ ipcMain.handle('start-automation', async (event, config) => {
     log(`📁 Tìm thấy ${files.length} ảnh`)
     log(`📂 Output: ${finalOutputFolder}`)
 
-    // Chuẩn bị danh sách ảnh cần xử lý (tối đa 5)
-    const maxImages = Math.min(files.length, 5)
-    const imagesToProcess = files.slice(0, maxImages)
-    
-    log(`🖥️ Sẽ xử lý ${maxImages} ảnh đồng thời trong 5 browsers...`)
+    // Chạy 1 batch (tối đa CONCURRENCY ảnh song song). Trả về map filename → kết quả.
+    const runBatch = async (
+      batchFiles: string[],
+      passLabel: string
+    ): Promise<Array<{ success: boolean; fileName: string; error?: string }>> => {
+      log(`🖥️ ${passLabel}: chạy ${batchFiles.length} ảnh song song...`)
+      return Promise.all(
+        batchFiles.map((file, idx) => {
+          const imagePath = path.join(inputFolder, file)
+          return processImageInBrowser(
+            imagePath,
+            idx,
+            promptTemplate,
+            chromePath,
+            finalOutputFolder,
+            waitTimeUpload || 5000,
+            waitTimeGenerate || 120000,
+            log
+          )
+        })
+      )
+    }
 
-    // Chạy 5 browsers song song
-    const results = await Promise.all(
-      imagesToProcess.map((file, index) => {
-        const imagePath = path.join(inputFolder, file)
-        return processImageInBrowser(
-          imagePath,
-          index,
-          promptTemplate,
-          chromePath,
-          finalOutputFolder,
-          waitTimeUpload || 5000,
-          waitTimeGenerate || 120000,
-          log
-        )
-      })
-    )
+    // PASS 0: xử lý HẾT ảnh, cắt thành batch 5
+    const allResults = new Map<string, { success: boolean; fileName: string; error?: string }>()
+    let pending = [...files]
 
-    // Tổng hợp kết quả
-    const successCount = results.filter(r => r.success).length
-    const failedCount = results.length - successCount
-    
-    log(`🏁 Hoàn tất!`)
-    log(`✅ Thành công: ${successCount}/${results.length}`)
-    
-    if (failedCount > 0) {
-      log(`⚠️ Thất bại: ${failedCount}`)
-      for (const r of results.filter(r => !r.success)) {
-        log(`  - ${r.fileName}: ${r.error}`)
+    for (let i = 0; i < pending.length; i += CONCURRENCY) {
+      if (shouldStop) { log('⏹️ Đã dừng theo yêu cầu người dùng'); break }
+      const batch = pending.slice(i, i + CONCURRENCY)
+      const batchNum = Math.floor(i / CONCURRENCY) + 1
+      const totalBatches = Math.ceil(pending.length / CONCURRENCY)
+      const results = await runBatch(batch, `Pass 1 — batch ${batchNum}/${totalBatches}`)
+      results.forEach((r, idx) => allResults.set(batch[idx], r))
+      const okInBatch = results.filter(r => r.success).length
+      log(`📊 Batch ${batchNum}/${totalBatches}: ${okInBatch}/${batch.length} ok`)
+    }
+
+    // RETRY PASS: gom ảnh fail, retry tối đa retryCap lần
+    for (let pass = 1; pass <= retryCap; pass++) {
+      if (shouldStop) break
+      const failedFiles = [...allResults.entries()]
+        .filter(([, r]) => !r.success)
+        .map(([f]) => f)
+      if (failedFiles.length === 0) {
+        log(`🎉 Không còn ảnh lỗi, skip retry pass ${pass}`)
+        break
+      }
+      log(`🔁 Retry pass ${pass}/${retryCap}: ${failedFiles.length} ảnh lỗi cần làm lại`)
+      for (let i = 0; i < failedFiles.length; i += CONCURRENCY) {
+        if (shouldStop) { log('⏹️ Đã dừng theo yêu cầu'); break }
+        const batch = failedFiles.slice(i, i + CONCURRENCY)
+        const batchNum = Math.floor(i / CONCURRENCY) + 1
+        const totalBatches = Math.ceil(failedFiles.length / CONCURRENCY)
+        const results = await runBatch(batch, `Retry ${pass} — batch ${batchNum}/${totalBatches}`)
+        results.forEach((r, idx) => {
+          // Chỉ cập nhật nếu retry thành công, giữ lỗi cũ nếu lại fail (để log rõ)
+          if (r.success) allResults.set(batch[idx], r)
+          else allResults.set(batch[idx], { ...r, error: `retry ${pass}: ${r.error || 'unknown'}` })
+        })
       }
     }
 
+    // Tổng hợp
+    const finalResults = [...allResults.values()]
+    const successCount = finalResults.filter(r => r.success).length
+    const failedList = finalResults.filter(r => !r.success)
+
+    log(`🏁 Hoàn tất!`)
+    log(`✅ Thành công: ${successCount}/${finalResults.length}`)
+    if (failedList.length > 0) {
+      log(`⚠️ Còn ${failedList.length} ảnh lỗi sau ${retryCap} retry:`)
+      for (const r of failedList) log(`  - ${r.fileName}: ${r.error}`)
+    }
+
     isRunning = false
-    return { success: true, processedCount: successCount, totalCount: results.length }
+    return { success: true, processedCount: successCount, totalCount: finalResults.length, failed: failedList }
 
   } catch (err) {
     log(`🔴 LỖI NGHIÊM TRỌNG: ${getErrorMessage(err)}`)
